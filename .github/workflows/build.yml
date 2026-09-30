@@ -1,0 +1,454 @@
+name: Build APK
+on: [push, workflow_dispatch]
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/setup-java@v5
+        with:
+          distribution: temurin
+          java-version: '17'
+      - uses: gradle/actions/setup-gradle@v5
+        with:
+          gradle-version: '8.7'
+      - name: Create project files
+        run: |
+          mkdir -p tgreader/app/src/main/java/com/example/tgreader
+          cd tgreader
+          cat > settings.gradle.kts <<'XEOF'
+          pluginManagement {
+              repositories { google(); mavenCentral(); gradlePluginPortal() }
+          }
+          dependencyResolutionManagement {
+              repositoriesMode.set(RepositoriesMode.FAIL_ON_PROJECT_REPOS)
+              repositories { google(); mavenCentral() }
+          }
+          rootProject.name = "TgReader"
+          include(":app")
+          XEOF
+          cat > build.gradle.kts <<'XEOF'
+          plugins {
+              id("com.android.application") version "8.5.2" apply false
+              id("org.jetbrains.kotlin.android") version "1.9.24" apply false
+          }
+          XEOF
+          cat > gradle.properties <<'XEOF'
+          org.gradle.jvmargs=-Xmx2048m -Dfile.encoding=UTF-8
+          android.useAndroidX=true
+          kotlin.code.style=official
+          XEOF
+          cat > app/build.gradle.kts <<'XEOF'
+          plugins {
+              id("com.android.application")
+              id("org.jetbrains.kotlin.android")
+          }
+          
+          android {
+              namespace = "com.example.tgreader"
+              compileSdk = 34
+              defaultConfig {
+                  applicationId = "com.example.tgreader"
+                  minSdk = 24
+                  targetSdk = 34
+                  versionCode = 1
+                  versionName = "1.0"
+              }
+              buildTypes { release { isMinifyEnabled = false } }
+              compileOptions {
+                  sourceCompatibility = JavaVersion.VERSION_17
+                  targetCompatibility = JavaVersion.VERSION_17
+              }
+              kotlinOptions { jvmTarget = "17" }
+          }
+          
+          dependencies {
+              implementation("org.jsoup:jsoup:1.17.2")
+          }
+          XEOF
+          cat > app/src/main/AndroidManifest.xml <<'XEOF'
+          <?xml version="1.0" encoding="utf-8"?>
+          <manifest xmlns:android="http://schemas.android.com/apk/res/android">
+          
+              <uses-permission android:name="android.permission.INTERNET" />
+          
+              <!-- Needed on Android 11+ so the app can see the installed TTS engine -->
+              <queries>
+                  <intent>
+                      <action android:name="android.intent.action.TTS_SERVICE" />
+                  </intent>
+              </queries>
+          
+              <application
+                  android:label="TG Reader"
+                  android:icon="@android:drawable/ic_btn_speak_now"
+                  android:theme="@android:style/Theme.Material.Light.NoActionBar">
+          
+                  <activity
+                      android:name=".MainActivity"
+                      android:exported="true"
+                      android:launchMode="singleTop"
+                      android:windowSoftInputMode="adjustResize">
+                      <intent-filter>
+                          <action android:name="android.intent.action.MAIN" />
+                          <category android:name="android.intent.category.LAUNCHER" />
+                      </intent-filter>
+                      <!-- Lets you Share any Telegram message (even from private channels) to this app -->
+                      <intent-filter android:label="Read aloud">
+                          <action android:name="android.intent.action.SEND" />
+                          <category android:name="android.intent.category.DEFAULT" />
+                          <data android:mimeType="text/plain" />
+                      </intent-filter>
+                  </activity>
+              </application>
+          </manifest>
+          XEOF
+          cat > app/src/main/java/com/example/tgreader/MainActivity.kt <<'XEOF'
+          package com.example.tgreader
+          
+          import android.app.Activity
+          import android.content.Intent
+          import android.content.SharedPreferences
+          import android.graphics.Typeface
+          import android.os.Bundle
+          import android.speech.tts.TextToSpeech
+          import android.speech.tts.UtteranceProgressListener
+          import android.view.Gravity
+          import android.view.View
+          import android.view.inputmethod.EditorInfo
+          import android.widget.*
+          import org.jsoup.Jsoup
+          import java.util.Locale
+          import java.util.concurrent.Executors
+          
+          class MainActivity : Activity(), TextToSpeech.OnInitListener {
+          
+              data class Post(val id: Long, val date: String, val text: String)
+          
+              private lateinit var tts: TextToSpeech
+              private lateinit var prefs: SharedPreferences
+              private var ttsReady = false
+              private var pendingShared: String? = null
+              private val io = Executors.newSingleThreadExecutor()
+          
+              private val posts = mutableListOf<Post>()
+              private val itemViews = mutableListOf<View>()
+              private var currentIndex = -1
+              private var playing = false
+              private var gen = 0            // bumps on every stop, so stale TTS callbacks get ignored
+              private var rate = 1.0f
+          
+              private val languages = listOf(
+                  "Device default" to Locale.getDefault(),
+                  "English" to Locale.US,
+                  "Русский" to Locale("ru", "RU"),
+                  "Українська" to Locale("uk", "UA"),
+                  "Deutsch" to Locale.GERMANY,
+                  "Español" to Locale("es", "ES"),
+                  "Français" to Locale.FRANCE,
+              )
+          
+              // UI
+              private lateinit var channelInput: EditText
+              private lateinit var status: TextView
+              private lateinit var scroll: ScrollView
+              private lateinit var list: LinearLayout
+              private lateinit var playBtn: Button
+              private lateinit var speedLabel: TextView
+              private lateinit var langSpinner: Spinner
+          
+              override fun onCreate(savedInstanceState: Bundle?) {
+                  super.onCreate(savedInstanceState)
+                  prefs = getSharedPreferences("tgreader", MODE_PRIVATE)
+                  rate = prefs.getFloat("rate", 1.0f)
+                  tts = TextToSpeech(this, this)
+                  setContentView(buildUi())
+                  channelInput.setText(prefs.getString("channel", ""))
+                  if (!handleShare(intent) && channelInput.text.isNotBlank()) load(older = false)
+              }
+          
+              override fun onNewIntent(intent: Intent) {
+                  super.onNewIntent(intent)
+                  handleShare(intent)
+              }
+          
+              override fun onDestroy() {
+                  tts.stop(); tts.shutdown(); io.shutdownNow()
+                  super.onDestroy()
+              }
+          
+              // ---------- TTS ----------
+          
+              override fun onInit(result: Int) {
+                  if (result != TextToSpeech.SUCCESS) {
+                      status.text = "Text-to-speech engine failed to start. Install Google Speech Services."
+                      return
+                  }
+                  ttsReady = true
+                  tts.setOnUtteranceProgressListener(object : UtteranceProgressListener() {
+                      override fun onStart(id: String?) {
+                          val p = parseId(id) ?: return
+                          runOnUiThread { if (p[0] == gen) { currentIndex = p[1]; highlight() } }
+                      }
+                      override fun onDone(id: String?) {
+                          val p = parseId(id) ?: return
+                          if (p[1] == posts.size - 1 && p[2] == p[3] - 1) runOnUiThread {
+                              if (p[0] == gen) { playing = false; updatePlayBtn(); status.text = "Finished — all caught up" }
+                          }
+                      }
+                      @Deprecated("Deprecated in Java")
+                      override fun onError(id: String?) {}
+                  })
+                  pendingShared?.let { pendingShared = null; speakShared(it) }
+              }
+          
+              private fun parseId(id: String?): IntArray? {
+                  val parts = id?.split(":") ?: return null
+                  if (parts.size != 4) return null
+                  return parts.map { it.toIntOrNull() ?: return null }.toIntArray()
+              }
+          
+              private fun applyVoice() {
+                  tts.setSpeechRate(rate)
+                  val locale = languages[langSpinner.selectedItemPosition.coerceAtLeast(0)].second
+                  val r = tts.setLanguage(locale)
+                  if (r == TextToSpeech.LANG_MISSING_DATA || r == TextToSpeech.LANG_NOT_SUPPORTED) {
+                      toast("Voice for ${locale.displayLanguage} isn't installed. Add it in Settings → Text-to-speech.")
+                  }
+              }
+          
+              private fun playFrom(start: Int) {
+                  if (!ttsReady) { toast("Speech engine still starting…"); return }
+                  if (posts.isEmpty()) return
+                  val i = start.coerceIn(0, posts.size - 1)
+                  gen++
+                  tts.stop()
+                  applyVoice()
+                  playing = true
+                  currentIndex = i
+                  for (j in i until posts.size) {
+                      val chunks = chunk(clean(posts[j].text))
+                      chunks.forEachIndexed { k, c ->
+                          tts.speak(c, TextToSpeech.QUEUE_ADD, null, "$gen:$j:$k:${chunks.size}")
+                      }
+                      tts.playSilentUtterance(700, TextToSpeech.QUEUE_ADD, "gap")
+                  }
+                  highlight()
+                  updatePlayBtn()
+              }
+          
+              private fun stopSpeaking() {
+                  gen++
+                  if (ttsReady) tts.stop()
+                  playing = false
+                  updatePlayBtn()
+              }
+          
+              private fun speakShared(text: String) {
+                  if (!ttsReady) { pendingShared = text; return }
+                  gen++
+                  tts.stop()
+                  applyVoice()
+                  chunk(clean(text)).forEach { tts.speak(it, TextToSpeech.QUEUE_ADD, null, "shared") }
+                  playing = false
+                  updatePlayBtn()
+                  status.text = "Reading shared message…"
+              }
+          
+              /** Strip links and junk that sound awful when read out. */
+              private fun clean(s: String): String =
+                  s.replace(Regex("https?://\\S+"), " ")
+                      .replace(Regex("\\s+"), " ")
+                      .trim()
+          
+              /** TTS engines have an input limit (~4000 chars), so split long posts at sentence ends. */
+              private fun chunk(s: String): List<String> {
+                  val max = TextToSpeech.getMaxSpeechInputLength() - 100
+                  if (s.length <= max) return listOf(s)
+                  val out = mutableListOf<String>()
+                  val sb = StringBuilder()
+                  for (sentence in s.split(Regex("(?<=[.!?…])\\s+"))) {
+                      if (sb.length + sentence.length + 1 > max && sb.isNotEmpty()) { out += sb.toString(); sb.clear() }
+                      if (sentence.length > max) sentence.chunked(max).forEach { out += it } else sb.append(sentence).append(' ')
+                  }
+                  if (sb.isNotBlank()) out += sb.toString()
+                  return out
+              }
+          
+              // ---------- Share intent ----------
+          
+              private fun handleShare(intent: Intent?): Boolean {
+                  if (intent?.action != Intent.ACTION_SEND) return false
+                  val text = intent.getStringExtra(Intent.EXTRA_TEXT) ?: return false
+                  speakShared(text)
+                  return true
+              }
+          
+              // ---------- Fetching ----------
+          
+              private fun normalize(input: String): String {
+                  var s = input.trim().removePrefix("@")
+                  if (s.contains("t.me/")) s = s.substringAfter("t.me/")
+                  return s.removePrefix("s/").substringBefore("/").substringBefore("?").trim()
+              }
+          
+              private fun fetch(channel: String, before: Long?): List<Post> {
+                  val url = "https://t.me/s/$channel" + (before?.let { "?before=$it" } ?: "")
+                  val doc = Jsoup.connect(url)
+                      .userAgent("Mozilla/5.0 (Linux; Android 14) AppleWebKit/537.36 Chrome/124 Mobile Safari/537.36")
+                      .timeout(15_000)
+                      .get()
+                  return doc.select("div.tgme_widget_message[data-post]").mapNotNull { el ->
+                      val id = el.attr("data-post").substringAfterLast('/').toLongOrNull() ?: return@mapNotNull null
+                      val text = el.selectFirst("div.tgme_widget_message_text")?.text()?.trim()
+                      if (text.isNullOrBlank()) return@mapNotNull null   // photo/video-only posts
+                      val date = el.selectFirst("time[datetime]")?.attr("datetime")
+                          ?.take(16)?.replace('T', ' ') ?: ""
+                      Post(id, date, text)
+                  }
+              }
+          
+              private fun load(older: Boolean) {
+                  val ch = normalize(channelInput.text.toString())
+                  if (ch.isEmpty()) { toast("Enter a public channel name"); return }
+                  stopSpeaking()
+                  if (!older) { posts.clear(); currentIndex = -1 }
+                  prefs.edit().putString("channel", ch).apply()
+                  status.text = "Loading @$ch…"
+                  val before = if (older) posts.firstOrNull()?.id else null
+                  io.execute {
+                      try {
+                          val got = fetch(ch, before)
+                          runOnUiThread {
+                              val known = posts.map { it.id }.toHashSet()
+                              val fresh = got.filter { it.id !in known }
+                              posts.addAll(0, fresh)
+                              if (older && currentIndex >= 0) currentIndex += fresh.size
+                              render()
+                              status.text = when {
+                                  posts.isEmpty() -> "No text posts found. The channel must be public (t.me/s/$ch must open in a browser)."
+                                  older && fresh.isEmpty() -> "No older posts."
+                                  else -> "@$ch · ${posts.size} posts · tap one to start reading"
+                              }
+                              if (!older) scroll.post { scroll.fullScroll(View.FOCUS_DOWN) }
+                          }
+                      } catch (e: Exception) {
+                          runOnUiThread { status.text = "Couldn't load: ${e.message}" }
+                      }
+                  }
+              }
+          
+              // ---------- UI ----------
+          
+              private fun Int.dp() = (this * resources.displayMetrics.density).toInt()
+          
+              private fun buildUi(): View {
+                  val root = LinearLayout(this).apply {
+                      orientation = LinearLayout.VERTICAL
+                      setPadding(12.dp(), 36.dp(), 12.dp(), 12.dp())
+                  }
+          
+                  val top = LinearLayout(this).apply { orientation = LinearLayout.HORIZONTAL; gravity = Gravity.CENTER_VERTICAL }
+                  channelInput = EditText(this).apply {
+                      hint = "Channel, e.g. durov or t.me/durov"
+                      isSingleLine = true
+                      imeOptions = EditorInfo.IME_ACTION_GO
+                      setOnEditorActionListener { _, a, _ -> if (a == EditorInfo.IME_ACTION_GO) { load(false); true } else false }
+                  }
+                  top.addView(channelInput, LinearLayout.LayoutParams(0, -2, 1f))
+                  top.addView(Button(this).apply { text = "Load"; setOnClickListener { load(false) } })
+                  root.addView(top)
+          
+                  status = TextView(this).apply {
+                      text = "Load a public channel, or Share a message to this app from Telegram."
+                      setPadding(4.dp(), 6.dp(), 4.dp(), 6.dp())
+                      textSize = 13f
+                  }
+                  root.addView(status)
+          
+                  scroll = ScrollView(this)
+                  list = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL }
+                  scroll.addView(list)
+                  root.addView(scroll, LinearLayout.LayoutParams(-1, 0, 1f))
+          
+                  val controls = LinearLayout(this).apply { orientation = LinearLayout.HORIZONTAL; gravity = Gravity.CENTER }
+                  fun btn(label: String, onClick: () -> Unit) = Button(this).apply { text = label; textSize = 18f; setOnClickListener { onClick() } }
+                  controls.addView(btn("⏮") { playFrom(maxOf(0, currentIndex - 1)) }, LinearLayout.LayoutParams(0, -2, 1f))
+                  playBtn = btn("▶") { if (playing) stopSpeaking() else playFrom(maxOf(0, currentIndex)) }
+                  controls.addView(playBtn, LinearLayout.LayoutParams(0, -2, 1.4f))
+                  controls.addView(btn("⏭") { playFrom(currentIndex + 1) }, LinearLayout.LayoutParams(0, -2, 1f))
+                  root.addView(controls)
+          
+                  val settings = LinearLayout(this).apply { orientation = LinearLayout.HORIZONTAL; gravity = Gravity.CENTER_VERTICAL }
+                  speedLabel = TextView(this).apply { text = "%.1fx".format(rate); minWidth = 44.dp() }
+                  val seek = SeekBar(this).apply {
+                      max = 25                                   // 0.5x … 3.0x
+                      progress = ((rate - 0.5f) * 10).toInt()
+                      setOnSeekBarChangeListener(object : SeekBar.OnSeekBarChangeListener {
+                          override fun onProgressChanged(s: SeekBar?, p: Int, fromUser: Boolean) {
+                              rate = 0.5f + p / 10f; speedLabel.text = "%.1fx".format(rate)
+                          }
+                          override fun onStartTrackingTouch(s: SeekBar?) {}
+                          override fun onStopTrackingTouch(s: SeekBar?) {
+                              prefs.edit().putFloat("rate", rate).apply()
+                              if (playing) playFrom(currentIndex)
+                          }
+                      })
+                  }
+                  langSpinner = Spinner(this).apply {
+                      adapter = ArrayAdapter(this@MainActivity, android.R.layout.simple_spinner_dropdown_item, languages.map { it.first })
+                      setSelection(prefs.getInt("lang", 0).coerceIn(0, languages.size - 1))
+                      onItemSelectedListener = object : AdapterView.OnItemSelectedListener {
+                          override fun onItemSelected(p: AdapterView<*>?, v: View?, pos: Int, id: Long) {
+                              prefs.edit().putInt("lang", pos).apply()
+                              if (playing) playFrom(currentIndex)
+                          }
+                          override fun onNothingSelected(p: AdapterView<*>?) {}
+                      }
+                  }
+                  settings.addView(speedLabel)
+                  settings.addView(seek, LinearLayout.LayoutParams(0, -2, 1f))
+                  settings.addView(langSpinner)
+                  root.addView(settings)
+                  return root
+              }
+          
+              private fun render() {
+                  list.removeAllViews()
+                  itemViews.clear()
+                  if (posts.isNotEmpty()) {
+                      list.addView(Button(this).apply { text = "Load older posts"; setOnClickListener { load(older = true) } })
+                  }
+                  posts.forEachIndexed { i, post ->
+                      val card = LinearLayout(this).apply {
+                          orientation = LinearLayout.VERTICAL
+                          setPadding(12.dp(), 10.dp(), 12.dp(), 10.dp())
+                          setOnClickListener { playFrom(i) }
+                      }
+                      card.addView(TextView(this).apply { text = post.date; textSize = 12f; setTypeface(typeface, Typeface.BOLD) })
+                      card.addView(TextView(this).apply { text = post.text; textSize = 15f; setTextIsSelectable(false) })
+                      list.addView(card, LinearLayout.LayoutParams(-1, -2).apply { setMargins(0, 4.dp(), 0, 4.dp()) })
+                      itemViews += card
+                  }
+                  highlight(scrollTo = false)
+              }
+          
+              private fun highlight(scrollTo: Boolean = true) {
+                  itemViews.forEachIndexed { i, v ->
+                      v.setBackgroundColor(if (i == currentIndex && playing) 0xFFFFE9A8.toInt() else 0xFFF1F1F4.toInt())
+                  }
+                  if (scrollTo && playing) itemViews.getOrNull(currentIndex)?.let { v -> scroll.post { scroll.smoothScrollTo(0, v.top) } }
+              }
+          
+              private fun updatePlayBtn() { playBtn.text = if (playing) "⏹" else "▶"; highlight(scrollTo = false) }
+          
+              private fun toast(msg: String) = Toast.makeText(this, msg, Toast.LENGTH_LONG).show()
+          }
+          XEOF
+          find . -type f
+      - name: Build
+        working-directory: tgreader
+        run: gradle assembleDebug --stacktrace
+      - uses: actions/upload-artifact@v4
+        with:
+          name: tg-reader-apk
+          path: tgreader/app/build/outputs/apk/debug/*.apk
